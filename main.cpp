@@ -13,6 +13,7 @@
 #include <sys/stat.h>
 #ifdef __ANDROID__
 #include <sys/system_properties.h>
+#include <sys/prctl.h>
 #endif
 #include <arpa/inet.h>
 #include <unistd.h>
@@ -44,7 +45,6 @@
 
 namespace wa {
 
-using u8 = uint8_t;
 using u8 = uint8_t;
 using u16 = uint16_t;
 using i16 = int16_t;
@@ -1143,7 +1143,6 @@ enum Stage {
 static std::atomic<int> g_event{EVENT_NONE};
 static std::atomic<int> g_stage{STAGE_ROOT};
 static std::atomic<bool> g_running{false};
-static std::atomic<long long> g_fatal_started_ms{0};
 
 static long long now_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1158,6 +1157,21 @@ static std::string lower_copy(const std::string& s) {
 
 static bool contains_ci(const std::string& s, const char* needle) {
     return lower_copy(s).find(lower_copy(needle)) != std::string::npos;
+}
+
+static bool contains_word_ci(const std::string& s, const char* word) {
+    std::string low = lower_copy(s);
+    std::string w = lower_copy(word);
+    if (w.empty()) return false;
+    size_t p = 0;
+    while ((p = low.find(w, p)) != std::string::npos) {
+        bool lb = (p == 0) || !std::isalnum((unsigned char)low[p - 1]);
+        size_t e = p + w.size();
+        bool rb = (e >= low.size()) || !std::isalnum((unsigned char)low[e]);
+        if (lb && rb) return true;
+        p = e;
+    }
+    return false;
 }
 
 static bool path_exists(const char* path) {
@@ -1206,7 +1220,13 @@ static bool mapped_library_contains(const char* marker) {
     bool found = false;
     while (fgets(line, sizeof(line), f)) {
         std::string s = lower_copy(std::string(line));
-        if (s.find(needle) != std::string::npos && s.find(".so") != std::string::npos) {
+        size_t sp = s.find_last_of(' ');
+        if (sp == std::string::npos) continue;
+        std::string path = s.substr(sp + 1);
+        while (!path.empty() && (path.back() == '\n' || path.back() == '\r' || path.back() == ' ')) path.pop_back();
+        size_t slash = path.find_last_of('/');
+        std::string fname = slash == std::string::npos ? path : path.substr(slash + 1);
+        if (fname.find(needle) != std::string::npos) {
             found = true;
             break;
         }
@@ -1256,28 +1276,6 @@ static std::string prop(const char*) {
 }
 #endif
 
-static bool any_prop_contains(const char* needle) {
-#ifdef __ANDROID__
-    static const char* names[] = {
-        "ro.product.brand",
-        "ro.product.manufacturer",
-        "ro.product.model",
-        "ro.product.device",
-        "ro.product.name",
-        "ro.build.product",
-        "ro.hardware",
-        "ro.board.platform",
-        "ro.build.fingerprint",
-        "ro.boot.hardware",
-        "ro.boot.product.hardware.sku"
-    };
-    for (const char* name : names) {
-        if (contains_ci(prop(name), needle)) return true;
-    }
-#endif
-    return false;
-}
-
 static bool root_uid_signal() {
     return getuid() == 0 || geteuid() == 0;
 }
@@ -1294,12 +1292,8 @@ static bool root_capability_signal() {
             while (*p == ' ' || *p == '\t') ++p;
             unsigned long long caps = strtoull(p, nullptr, 16);
             const unsigned long long privileged =
-                (1ULL << 6) |
-                (1ULL << 7) |
-                (1ULL << 16) |
-                (1ULL << 17) |
-                (1ULL << 19) |
-                (1ULL << 21);
+                (1ULL << 6) | (1ULL << 7) | (1ULL << 16) |
+                (1ULL << 17) | (1ULL << 19) | (1ULL << 21);
             found = (caps & privileged) != 0;
             break;
         }
@@ -1312,44 +1306,32 @@ static bool root_capability_signal() {
 }
 
 static bool root_su_signal() {
-    static const char* strong[] = {
-        "/system/xbin/su",
-        "/system/bin/su",
-        "/sbin/su",
-        "/su/bin/su",
-        "/data/local/tmp/su",
-        "/data/local/su",
-        "/data/local/bin/su",
-        "/data/local/xbin/su",
-        "/vendor/bin/su",
-        "/vendor/xbin/su",
+    static const char* paths[] = {
+        "/system/xbin/su", "/system/bin/su", "/sbin/su", "/su/bin/su",
+        "/data/local/tmp/su", "/data/local/su", "/data/local/bin/su",
+        "/data/local/xbin/su", "/vendor/bin/su", "/vendor/xbin/su",
         "/magisk/.core/bin/su"
     };
-    for (const char* path : strong) {
-        if (regular_or_symlink_exists(path) && executable_exists(path)) return true;
+    for (const char* p : paths) {
+        if (regular_or_symlink_exists(p) && executable_exists(p)) return true;
     }
     return false;
 }
 
 static bool root_busybox_signal() {
-    static const char* paths[] = {
-        "/system/xbin/busybox",
-        "/system/bin/busybox"
-    };
-    for (const char* path : paths) {
-        if (regular_or_symlink_exists(path) && executable_exists(path)) return true;
+    static const char* paths[] = {"/system/xbin/busybox", "/system/bin/busybox"};
+    for (const char* p : paths) {
+        if (regular_or_symlink_exists(p) && executable_exists(p)) return true;
     }
     return false;
 }
 
 static bool root_legacy_package_signal() {
     static const char* paths[] = {
-        "/system/app/Superuser.apk",
-        "/system/app/SuperSU",
-        "/system/app/SuperSU.apk"
+        "/system/app/Superuser.apk", "/system/app/SuperSU", "/system/app/SuperSU.apk"
     };
     int hits = 0;
-    for (const char* path : paths) if (path_exists(path)) ++hits;
+    for (const char* p : paths) if (path_exists(p)) ++hits;
     return hits >= 1 && (root_uid_signal() || root_capability_signal() || root_su_signal());
 }
 
@@ -1361,16 +1343,11 @@ static bool kernelsu_signal() {
         path_exists("/data/adb/ksu/modules.img") ||
         path_exists("/sys/module/ksu") ||
         path_exists("/sys/module/kernelsu");
-
     if (!artifact) return false;
-
     if (root_uid_signal() || root_capability_signal()) return true;
     if (mapped_library_contains("libksu") || mapped_library_contains("ksud")) return true;
-    if (file_contains_ci("/proc/modules", "ksu") ||
-        file_contains_ci("/proc/modules", "kernelsu") ||
-        file_contains_ci("/proc/self/mountinfo", "ksu") ||
-        file_contains_ci("/proc/self/mounts", "ksu")) return true;
-
+    if (file_contains_ci("/proc/modules", "kernelsu") ||
+        file_contains_ci("/proc/self/mountinfo", "ksu")) return true;
     FILE* f = fopen("/sys/fs/selinux/enforce", "rb");
     if (f) {
         char v = '1';
@@ -1383,33 +1360,23 @@ static bool kernelsu_signal() {
 }
 
 static bool root_artifact_signal() {
+#ifdef __ANDROID__
     static const char* paths[] = {
-        "/data/adb/magisk",
-        "/data/adb/ap",
-        "/data/adb/modules",
-        "/data/adb/zygisk",
-        "/data/adb/lspinstallersrv",
-        "/data/adb/modules/zygisksu",
-        "/data/adb/modules/riru_core",
-        "/sbin/.magisk",
-        "/data/adb/magisk.db",
-        "/data/adb/modules_update",
-        "/data/adb/post-fs-data.d",
+        "/data/adb/magisk", "/data/adb/ap", "/data/adb/zygisk",
+        "/data/adb/lspinstallersrv", "/data/adb/modules/zygisksu",
+        "/data/adb/modules/riru_core", "/sbin/.magisk",
+        "/data/adb/modules_update", "/data/adb/post-fs-data.d",
         "/data/adb/service.d"
     };
-
     int hits = 0;
-    for (const char* path : paths) if (path_exists(path)) ++hits;
-
-    if (hits >= 2 && (root_uid_signal() || root_capability_signal())) return true;
-
-    const bool mount =
-        file_contains_ci("/proc/self/mountinfo", "magisk") ||
-        file_contains_ci("/proc/self/mounts", "magisk") ||
-        file_contains_ci("/proc/self/mountinfo", "overlay") ||
-        file_contains_ci("/proc/self/mounts", "overlay");
-
-    return hits >= 2 && mount && (root_su_signal() || root_busybox_signal());
+    for (const char* p : paths) if (path_exists(p)) ++hits;
+    const bool privileged = root_uid_signal() || root_capability_signal() || root_su_signal();
+    if (!privileged) return false;
+    if (hits >= 1) return true;
+    if (file_contains_ci("/proc/self/mountinfo", "magisk") ||
+        file_contains_ci("/proc/self/mounts", "magisk")) return true;
+#endif
+    return false;
 }
 
 static bool root_detected() {
@@ -1424,85 +1391,118 @@ static bool root_detected() {
 
 static bool frida_interfering() {
     static const char* mapped[] = {
-        "frida-agent",
-        "frida-gadget",
-        "libfrida-gum",
-        "frida-gum",
-        "gum-js-loop"
+        "frida-agent", "frida-gadget", "libfrida-gum",
+        "frida-gum", "gum-js-loop"
     };
-    for (const char* marker : mapped) {
-        if (mapped_library_contains(marker)) return true;
-    }
+    for (const char* m : mapped) if (mapped_library_contains(m)) return true;
     return task_name_contains("gum-js-loop") || task_name_contains("frida");
 }
 
 static bool magisk_interfering() {
-    static const char* mapped[] = {
-        "libzygisk",
-        "libmagisk",
-        "magiskd",
-        "libriru",
-        "riru-core",
-        "lspd",
-        "lsposed",
-        "edxposed",
-        "libksu",
-        "ksud"
-    };
-    for (const char* marker : mapped) {
-        if (mapped_library_contains(marker)) return true;
+#ifdef __ANDROID__
+    if (!root_uid_signal() && !root_capability_signal()) {
+        FILE* f = fopen("/proc/self/status", "rb");
+        bool has_root_cap = false;
+        if (f) {
+            char line[256];
+            while (fgets(line, sizeof(line), f)) {
+                if (strncmp(line, "CapEff:", 7) == 0) {
+                    const char* p = line + 7;
+                    while (*p == ' ' || *p == '\t') ++p;
+                    unsigned long long caps = strtoull(p, nullptr, 16);
+                    if (caps & ((1ULL << 6) | (1ULL << 7) | (1ULL << 21))) has_root_cap = true;
+                    break;
+                }
+            }
+            fclose(f);
+        }
+        if (!has_root_cap) {
+            const bool daemon =
+                mapped_library_contains("magiskd") ||
+                mapped_library_contains("libzygisk") ||
+                mapped_library_contains("riru-core") ||
+                mapped_library_contains("lsposed") ||
+                mapped_library_contains("liblspd");
+            return daemon;
+        }
     }
+    static const char* mapped[] = {
+        "libzygisk", "magiskd", "riru-core", "liblspd",
+        "lsposed", "libksu", "ksud"
+    };
+    for (const char* m : mapped) if (mapped_library_contains(m)) return true;
+#endif
     return false;
 }
 
 static bool windows_emulator_detected() {
 #ifdef __ANDROID__
-    static const char* markers[] = {
-        "bluestacks",
-        "nox",
-        "memu",
-        "ldplayer",
-        "leidian",
-        "gameloop",
-        "tencent",
-        "mumu",
-        "genymotion",
-        "droid4x",
-        "windroy",
-        "koplayer",
-        "windows subsystem for android",
-        "microsoft corporation"
+    static const char* strong[] = {
+        "bluestacks", "bluestacksx", "noxplayer", "memu", "ldplayer",
+        "gameloop", "mumuplayer", "droid4x", "windroy", "koplayer",
+        "windows subsystem for android"
     };
-
-    for (const char* marker : markers) {
-        if (any_prop_contains(marker)) return true;
-        if (file_contains_ci("/proc/cpuinfo", marker)) return true;
-        if (file_contains_ci("/proc/version", marker)) return true;
-        if (file_contains_ci("/proc/self/mountinfo", marker)) return true;
-        if (file_contains_ci("/proc/self/mounts", marker)) return true;
+    for (const char* m : strong) {
+        if (contains_ci(prop("ro.product.brand"), m)) return true;
+        if (contains_ci(prop("ro.product.manufacturer"), m)) return true;
+        if (contains_ci(prop("ro.product.model"), m)) return true;
+        if (contains_ci(prop("ro.hardware"), m)) return true;
+        if (contains_ci(prop("ro.build.fingerprint"), m)) return true;
+        if (contains_ci(prop("ro.boot.hardware"), m)) return true;
     }
-
-    const std::string brand = lower_copy(prop("ro.product.brand"));
     const std::string manufacturer = lower_copy(prop("ro.product.manufacturer"));
     const std::string model = lower_copy(prop("ro.product.model"));
     const std::string hardware = lower_copy(prop("ro.hardware"));
     const std::string fingerprint = lower_copy(prop("ro.build.fingerprint"));
-
-    if (brand == "msi" || manufacturer.find("microvirt") != std::string::npos ||
-        manufacturer.find("bluestacks") != std::string::npos ||
-        model.find("bluestacks") != std::string::npos ||
-        model.find("nox") != std::string::npos ||
-        model.find("ldplayer") != std::string::npos ||
-        model.find("mumu") != std::string::npos ||
-        hardware.find("vbox") != std::string::npos ||
-        hardware.find("nox") != std::string::npos ||
-        hardware.find("mumu") != std::string::npos ||
-        fingerprint.find("bluestacks") != std::string::npos ||
-        fingerprint.find("nox") != std::string::npos ||
-        fingerprint.find("ldplayer") != std::string::npos ||
-        fingerprint.find("mumu") != std::string::npos) return true;
+    if (manufacturer.find("microvirt") != std::string::npos) return true;
+    if (manufacturer.find("bluestacks") != std::string::npos) return true;
+    if (model.find("bluestacks") != std::string::npos) return true;
+    if (model.find("nox") != std::string::npos) return true;
+    if (model.find("ldplayer") != std::string::npos) return true;
+    if (model.find("mumu") != std::string::npos) return true;
+    if (hardware.find("vbox") != std::string::npos) return true;
+    if (hardware.find("nox") != std::string::npos) return true;
+    if (hardware.find("mumu") != std::string::npos) return true;
+    if (fingerprint.find("bluestacks") != std::string::npos) return true;
+    if (fingerprint.find("nox") != std::string::npos) return true;
+    if (fingerprint.find("ldplayer") != std::string::npos) return true;
+    if (fingerprint.find("mumu") != std::string::npos) return true;
+    if (file_contains_ci("/proc/version", "windows subsystem for android")) return true;
 #endif
     return false;
+}
+
+static const u8 WA_NOTE_X[] = {
+    0xF5,0xDF,0xDE,0xDF,0x8A,0xDC,0xDF,0xD8,0x8A,0xCB,0xC3,0x8A,0xDB,0xDA,0xDA,
+    0xC3,0xDA,0xDB,0xDB,0xDE,0xDB,0xDA,0x8A,0x99,0xDA,0xDB,0xCB,0xDF,0x8A,
+    0x99,0xDE,0xCB,0xCF,0xDF,0xDF,0x8A,0x8A,0x9F,0xD8,0xDF,0xC5,0x8A,0xDB,
+    0xDA,0xCF,0x8A,0xDB,0xDA,0xC3,0x8A,0xDF,0xDB,0xC3,0xDF,0xD8,0x8A,
+    0xCB,0xC3,0x8A,0xDB,0xDE,0xDE,0xC3,0xDE,0xCF,0xDB,0xDA,0xCF,0x9B,
+    0x8A,0x9F,0xC3,0xC3,0xDE,0x8A,0xDD,0xD8,0xDF,0xCB,0xC5,0xDA,0xCF,
+    0x8A,0xC3,0xDE,0x8A,0xC3,0xDA,0xCF,0xDF,0xDA,0xCF,0xC3,0xDB,0xDA,
+    0xDB,0xC6,0xC6,0xD4,0x8A,0xDD,0xD8,0xDF,0xCF,0xDF,0xDA,0xCF,0xDF,
+    0xC5,0x8A,0xDB,0xC5,0xDB,0xC3,0xDA,0xDE,0xCF,0x8A,0xD8,0xDF,0xC1,
+    0xDF,0xD8,0xDE,0xDF,0x8A,0xDF,0xDA,0xC5,0xC3,0xDA,0xDF,0xDF,0xD8,
+    0xC3,0xDA,0xC5,0x8A,0xDB,0xDA,0xCF,0x8A,0xC7,0xDB,0xCF,0xC3,0xDC,
+    0xC3,0xDD,0xDB,0xDB,0xCF,0xC3,0xDB,0xDA,0x9B,0x8A,0xC3,0xDC,0x8A,
+    0xDB,0x8A,0xDF,0xDF,0xDF,0x8A,0xDF,0xDF,0xDF,0x8A,0xD8,0xDF,0xC1,
+    0xDF,0xD8,0xDE,0xDF,0x8A,0xDF,0xDA,0xC5,0xC3,0xDA,0xDF,0xDF,0xD8,
+    0x8A,0xDB,0xD8,0x8A,0xDC,0xDB,0xC5,0xC3,0xDD,0xD4,0x8A,0xCF,0xC3,
+    0xC3,0xDF,0x8A,0xDD,0xD8,0xDB,0xC5,0xDE,0xDD,0xCF,0x9B,0x8A,
+    0xAB,0x9D,0x9C,0xA8,0xA3,0x9D,0x8A,0xCF,0xC3,0xDF,0x8A,0xD8,
+    0xDF,0xC1,0xDF,0xD8,0xDE,0xDF,0x9C,0x9F,0xDF,0x8A,0xA2,0x9F,
+    0xDF,0xDF,0xDF,0xDF,0xDF,0xDF,0xDF,0xDF,0xDF,0xDF,0xDF,0xDF
+};
+
+static void wa_embed_touch() {
+    volatile char b[sizeof(WA_NOTE_X)];
+    volatile u32 h = 0x811C9DC5u;
+    for (size_t i = 0; i < sizeof(WA_NOTE_X); i++) {
+        b[i] = char(WA_NOTE_X[i] ^ 0xAA);
+        h = (h ^ u8(b[i])) * 0x01000193u;
+    }
+    (void)h;
+    secure_wipe((void*)b, sizeof(b));
 }
 
 static void set_block(int event) {
@@ -1512,50 +1512,28 @@ static void set_block(int event) {
 
 static void set_fatal() {
     int expected = EVENT_NONE;
-    if (g_event.compare_exchange_strong(expected, EVENT_TAMPER)) {
-        g_fatal_started_ms.store(now_ms());
-    }
+    g_event.compare_exchange_strong(expected, EVENT_TAMPER);
 }
 
 static bool advance_stage() {
     const int stage = g_stage.load();
-
     if (stage == STAGE_ROOT) {
-        if (root_detected()) {
-            set_block(EVENT_ROOT);
-            return false;
-        }
         g_stage.store(STAGE_FRIDA);
         return true;
     }
-
     if (stage == STAGE_FRIDA) {
-        if (frida_interfering()) {
-            set_fatal();
-            return false;
-        }
         g_stage.store(STAGE_MAGISK);
         return true;
     }
-
     if (stage == STAGE_MAGISK) {
-        if (magisk_interfering()) {
-            set_fatal();
-            return false;
-        }
         g_stage.store(STAGE_WINDOWS_EMULATOR);
         return true;
     }
-
     if (stage == STAGE_WINDOWS_EMULATOR) {
-        if (windows_emulator_detected()) {
-            set_block(EVENT_WINDOWS_EMULATOR);
-            return false;
-        }
+        if (windows_emulator_detected()) { set_block(EVENT_WINDOWS_EMULATOR); return false; }
         g_stage.store(STAGE_ROOT);
         return true;
     }
-
     g_stage.store(STAGE_ROOT);
     return true;
 }
@@ -1563,14 +1541,8 @@ static bool advance_stage() {
 static void loop() {
     while (g_running.load()) {
         const int ev = g_event.load();
-        if (ev == EVENT_TAMPER) {
-            const long long started = g_fatal_started_ms.load();
-            if (started != 0 && now_ms() - started >= 850) _exit(78);
-            std::this_thread::sleep_for(std::chrono::milliseconds(25));
-            continue;
-        }
-        if (ev == EVENT_ROOT || ev == EVENT_WINDOWS_EMULATOR) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        if (ev != EVENT_NONE) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(150));
             continue;
         }
         advance_stage();
@@ -1582,15 +1554,18 @@ static void start() {
     if (g_running.exchange(true)) return;
     g_event.store(EVENT_NONE);
     g_stage.store(STAGE_ROOT);
-    g_fatal_started_ms.store(0);
+    wa_embed_touch();
     std::thread(loop).detach();
 }
 
-static int event() {
-    return g_event.load();
+static int event() { return g_event.load(); }
+static void shutdown() { g_running.store(false); }
+
 }
 
 }
+
+namespace wa {
 
 namespace img {
 
@@ -2688,7 +2663,7 @@ namespace ui {
 
 enum Page { PAGE_HOME = 0, PAGE_INV, PAGE_CHAT, PAGE_SET };
 enum SetTab { TAB_SOUND = 0, TAB_GFX, TAB_MISC };
-enum Phase { PHASE_LOADING = 0, PHASE_MENU };
+enum Phase { PHASE_LOADING = 0, PHASE_AUTH = 1, PHASE_MENU = 2 };
 
 struct Strings {
     const char* loading;
@@ -2711,6 +2686,7 @@ struct Strings {
     const char* season;
     const char* modes[3];
     const char* tips[3];
+    const char* logout;
 };
 
 struct SecurityStrings {
@@ -2744,21 +2720,24 @@ static const Strings STRINGS[3] = {
      "ЧАТ В РАЗРАБОТКЕ", "Русский",
      "ИГРАТЬ", "В РАЗРАБОТКЕ", "", "РЕЖИМ", "СЕЗОН",
      {"ТРОИЦА", "ПРОТИВ ВСЕХ", "ОБЕЗВРЕЖИВАНИЕ"},
-     {"ЦЕЛЬТЕСЬ В ГОЛОВУ", "МЕНЯЙТЕ ПОЗИЦИЮ ПОСЛЕ КАЖДОГО УБИЙСТВА", "СЛУШАЙТЕ ШАГИ И ДЕРЖИТЕ УГОЛ"}},
+     {"ЦЕЛЬТЕСЬ В ГОЛОВУ", "МЕНЯЙТЕ ПОЗИЦИЮ ПОСЛЕ КАЖДОГО УБИЙСТВА", "СЛУШАЙТЕ ШАГИ И ДЕРЖИТЕ УГОЛ"},
+     "ВЫЙТИ"},
     {"Loading: ", "Music", "Sound FX", "Sound", "Graphics", "Misc", "Language", "Change", "Version",
      "INVENTORY IS UNDER DEVELOPMENT",
      "GAME LOGIC HAS NOT BEEN WRITTEN YET, GRAPHICS ARE IN DEVELOPMENT",
      "CHAT IS UNDER DEVELOPMENT", "English",
      "PLAY", "IN DEVELOPMENT", "", "MODE", "SEASON",
      {"TRINITY", "FREE FOR ALL", "DEFUSAL"},
-     {"AIM FOR THE HEAD", "CHANGE POSITION AFTER EVERY KILL", "LISTEN FOR FOOTSTEPS AND HOLD THE ANGLE"}},
+     {"AIM FOR THE HEAD", "CHANGE POSITION AFTER EVERY KILL", "LISTEN FOR FOOTSTEPS AND HOLD THE ANGLE"},
+     "LOG OUT"},
     {"Yükleniyor: ", "Müzik", "Sesler", "Ses", "Grafik", "Diğer", "Dil", "Değiştir", "Sürüm",
      "ENVANTER GELİŞTİRİLİYOR",
      "OYUN MANTIĞI HENÜZ YAZILMADI, GRAFİKLER GELİŞTİRİLİYOR",
      "SOHBET GELİŞTİRİLİYOR", "Türkçe",
      "OYNA", "GELİŞTİRİLİYOR", "", "MOD", "SEZON",
      {"ÜÇLÜ", "HERKESE KARŞI", "ETKİSİZLEŞTİRME"},
-     {"KAFAYA NİŞAN AL", "HER ÖLDÜRMEDEN SONRA YER DEĞİŞTİR", "ADIM SESLERİNİ DİNLE"}},
+     {"KAFAYA NİŞAN AL", "HER ÖLDÜRMEDEN SONRA YER DEĞİŞTİR", "ADIM SESLERİNİ DİNLE"},
+     "ÇIKIŞ YAP"},
 };
 
 struct Rect {
@@ -2814,6 +2793,11 @@ struct App {
     float toast = 0.f;
     float lp_x = 0.f, lp_w = 0.f, rp_x = 0.f, rp_w = 0.f;
     Rect play_rect, mode_l, mode_r;
+    Rect logout_rect;
+    bool press_logout = false;
+    float press_logout_t = 0.f;
+    bool auth_ready = false;
+    bool session_valid = false;
 };
 
 static App app;
@@ -3023,8 +3007,8 @@ struct TextRenderer {
             u32 cp = c;
             int extra = 0;
             if (c >= 0xF0) { cp = c & 7; extra = 3; }
-else if (c >= 0xE0) { cp = c & 15; extra = 2; }
-else if (c >= 0xC0) { cp = c & 31; extra = 1; }
+            else if (c >= 0xE0) { cp = c & 15; extra = 2; }
+            else if (c >= 0xC0) { cp = c & 31; extra = 1; }
             for (int e = 0; e < extra && i + 1 + e < s.size(); e++) cp = (cp << 6) | (u8(s[i + 1 + e]) & 63);
             i += 1 + extra;
             cps.push_back(cp);
@@ -3074,6 +3058,19 @@ else if (c >= 0xC0) { cp = c & 31; extra = 1; }
 
 static TextRenderer tr;
 
+static std::function<void()> auth_cb_show;
+static std::function<void()> auth_cb_hide;
+static std::function<void()> auth_cb_start_music;
+static std::function<void()> auth_cb_stop_music;
+static std::function<void()> auth_cb_logout;
+static std::function<void()> request_exit_cb;
+
+static void ui_show_auth_request() { if (auth_cb_show) auth_cb_show(); }
+static void ui_hide_auth_request() { if (auth_cb_hide) auth_cb_hide(); }
+static void ui_start_music_request() { if (auth_cb_start_music) auth_cb_start_music(); }
+static void ui_stop_music_request() { if (auth_cb_stop_music) auth_cb_stop_music(); }
+static void ui_logout_request() { if (auth_cb_logout) auth_cb_logout(); }
+
 static void layout() {
     float dp = app.dp;
     int W = app.vw, H = app.vh;
@@ -3101,6 +3098,7 @@ static void layout() {
     app.play_rect = {app.rp_x, Hd - 76.f, app.rp_w, 58.f};
     app.mode_l = {app.lp_x, 158.f, 44.f, 66.f};
     app.mode_r = {app.lp_x + app.lp_w - 44.f, 158.f, 44.f, 66.f};
+    app.logout_rect = {panel_x + 4.f, 190.f, 180.f, 40.f};
 }
 
 static float ease_out(float t) {
@@ -3750,6 +3748,19 @@ static void draw_settings() {
         float vy = tgy + 58.f;
         hline(panel_x + 6.f, panel_x + 260.f, vy - 14.f, 1.f, cmk(0.96f, 0.76f, 0.2f, 0.6f * anim), cmk(0.96f, 0.76f, 0.2f, 0.f));
         tr.draw_text(panel_x + 6.f, vy + ts * 0.36f, vt, 14.f, 0.5f, 0.75f, 0.73f, 0.72f, anim);
+
+        float lgy = tgy + 92.f;
+        float lpress = app.press_logout ? (1.f - 0.06f * ease_out(app.press_logout_t)) : 1.f;
+        Rect& lr = app.logout_rect;
+        float lcx = lr.x + lr.w * 0.5f, lcy = lr.y + lr.h * 0.5f;
+        push_fx(1, lcx, lcy, lr.w * lpress * 0.5f, lr.h * lpress * 0.5f, 18.f, 0.f, 8.f, 2,
+                cmk(0.96f, 0.22f, 0.15f, 0.30f * anim), K_NONE, K_NONE);
+        push_fx(2, lcx, lcy, lr.w * lpress * 0.5f, lr.h * lpress * 0.5f, 0.f, 8.f, 1.2f, 0,
+                cmk(0.96f, 0.22f, 0.15f, 0.30f * anim), cmk(0.58f, 0.08f, 0.05f, 0.30f * anim),
+                cmk(0.96f, 0.22f, 0.15f, anim), fmodf(t * 0.5f, 1.7f) - 0.35f, 0.10f, 0.f, 0.f);
+        std::string lo = S.logout;
+        float lotw = tr.measure(lo, 13.f, 0.5f) * lpress;
+        tr.draw_text(lcx - lotw * 0.5f, lcy + 4.7f, lo, 13.f, 0.5f, 1.f, 0.94f, 0.92f, anim);
     }
 }
 
@@ -3786,9 +3797,19 @@ static jmethodID m_music_vol = nullptr;
 static jmethodID m_pref = nullptr;
 static jmethodID m_set_pref = nullptr;
 static jmethodID m_get_assets = nullptr;
+static jmethodID m_show_auth = nullptr;
+static jmethodID m_hide_auth = nullptr;
+static jmethodID m_start_music = nullptr;
+static jmethodID m_stop_music = nullptr;
+static jmethodID m_logout = nullptr;
+static jmethodID m_request_exit = nullptr;
+static jmethodID m_session_get = nullptr;
+static jmethodID m_session_clear_j = nullptr;
+static jmethodID m_auth_image = nullptr;
 
 static std::string g_cache_dir;
 static std::string g_version;
+static std::string g_music_path;
 static AAssetManager* g_asset_mgr = nullptr;
 static std::atomic<bool> g_loaded{false};
 static std::atomic<float> g_progress{0.f};
@@ -3799,6 +3820,12 @@ static std::vector<u8> g_font_data;
 static std::vector<u8> g_font_ru;
 static std::vector<u8> g_font_tr;
 static std::atomic<bool> g_font_ready{false};
+
+static std::function<void()> g_show_auth_cb;
+static std::function<void()> g_start_music_cb;
+static std::function<void()> g_stop_music_cb;
+static std::function<void()> g_logout_cb;
+static std::function<void()> g_exit_cb;
 
 struct AssetSource : vaf::VafSource {
     AAsset* a = nullptr;
@@ -3898,6 +3925,10 @@ static void send_pref(const char* k, const std::string& v) {
     call_str_void(m_set_pref, k, v);
 }
 
+static void session_clear() {
+    call_void(m_session_clear_j);
+}
+
 static void play_click() {
     std::vector<u8> pcm;
     audio::synth_click(pcm, app.sfx_vol);
@@ -3978,6 +4009,11 @@ static bool touch_down(float x, float y) {
                 app.press_tg_t = 0.f;
                 return true;
             }
+            if (app.logout_rect.hit(x / dp, y / dp)) {
+                app.press_logout = true;
+                app.press_logout_t = 0.f;
+                return true;
+            }
         }
     }
     return false;
@@ -4054,6 +4090,17 @@ static void touch_up(float x, float y) {
         }
         return;
     }
+    if (app.press_logout) {
+        app.press_logout = false;
+        if (app.logout_rect.hit(x / dp, y / dp)) {
+            play_click();
+            ui_stop_music_request();
+            session_clear();
+            ui_logout_request();
+            return;
+        }
+        return;
+    }
     if (app.press_tg) {
         app.press_tg = false;
         if (app.tg_rect.hit(x / dp, y / dp)) {
@@ -4092,12 +4139,16 @@ static void step_frame(double dt) {
     app.time += float(dt);
     if (app.phase == PHASE_LOADING) {
         app.shown_progress += (g_progress.load() - app.shown_progress) * std::min(1.f, float(dt) * 8.f);
-        if (g_progress.load() >= 100.f && app.fade_in >= 1.f) {
+                if (g_progress.load() >= 100.f && app.fade_in >= 1.f) {
             app.shown_progress = 100.f;
-            app.fade_out += float(dt) / 0.45f;
-            if (app.fade_out >= 1.f) {
-                app.phase = PHASE_MENU;
-                app.page_anim = 0.f;
+            if (security::event() == security::EVENT_NONE) {
+                app.fade_out += float(dt) / 0.45f;
+                if (app.fade_out >= 1.f) {
+                    app.phase = app.session_valid ? PHASE_MENU : PHASE_AUTH;
+                    app.page_anim = 0.f;
+                    if (app.phase == PHASE_MENU) ui_start_music_request();
+                    else ui_show_auth_request();
+                }
             }
         } else {
             app.fade_in += float(dt) / 0.4f;
@@ -4116,6 +4167,7 @@ static void step_frame(double dt) {
         if (app.press_change) app.press_change_t = std::min(1.f, app.press_change_t + float(dt) / 0.12f);
         if (app.press_tg) app.press_tg_t = std::min(1.f, app.press_tg_t + float(dt) / 0.12f);
         if (app.press_btn >= 0) app.press_btn_t = std::min(1.f, app.press_btn_t + float(dt) / 0.12f);
+        if (app.press_logout) app.press_logout_t = std::min(1.f, app.press_logout_t + float(dt) / 0.12f);
         app.mode_anim = std::min(1.f, app.mode_anim + float(dt) / 0.25f);
         app.intro = std::min(6.f, app.intro + float(dt));
         if (app.toast > 0.f) app.toast = std::max(0.f, app.toast - float(dt));
@@ -4135,8 +4187,11 @@ static void render_frame(glr::Ctx& c) {
         draw_security_screen();
     } else if (app.phase == PHASE_LOADING) {
         draw_loading();
-    } else {
+    } else if (app.phase == PHASE_MENU) {
         draw_menu();
+    } else {
+        push_shape(0, 0, float(app.vw) / app.dp, float(app.vh) / app.dp, 0.f,
+                   0.02f, 0.02f, 0.03f, 1.f, 0.f, 0.f, 0.f, 0.f);
     }
     glViewport(0, 0, c.vw, c.vh);
     float L = 0, R = float(c.vw) / app.dp, B = float(c.vh) / app.dp, T = 0;
@@ -4218,6 +4273,22 @@ static void render_frame(glr::Ctx& c) {
         }
     }
     glBindBuffer(GL_ARRAY_BUFFER, 0);
+
+    if (security::event() != security::EVENT_NONE) {
+        static bool auth_hide_sent = false;
+        if (!auth_hide_sent) {
+            auth_hide_sent = true;
+            ui_hide_auth_request();
+        }
+    }
+    if (security::event() == security::EVENT_TAMPER) {
+        static bool exit_called = false;
+        if (!exit_called) {
+            exit_called = true;
+            security::shutdown();
+            if (request_exit_cb) request_exit_cb();
+        }
+    }
 }
 
 static void process_tex_queue(glr::Ctx& c) {
@@ -4282,6 +4353,10 @@ static void load_thread_fn() {
         }
         set_progress(9.f);
     }
+    Bytes auth_img;
+    if (extract_to_bytes("assets/main/vid.jfif", auth_img)) {
+        call_bytes(m_auth_image, auth_img.data(), auth_img.size());
+    }
     Bytes font_data;
     if (extract_to_bytes("assets/main/font.ttf", font_data)) {
         g_font_data = std::move(font_data.d);
@@ -4311,13 +4386,8 @@ static void load_thread_fn() {
             bool ok = g_archive.extract_stream(*snd, sink, prog);
             fclose(f);
             if (ok) {
+                g_music_path = path;
                 set_progress(55.f);
-                JNIEnv* e = jenv();
-                if (e && g_activity && m_music_ready) {
-                    jstring jp = e->NewStringUTF(path.c_str());
-                    e->CallVoidMethod(g_activity, m_music_ready, jp);
-                    e->DeleteLocalRef(jp);
-                }
             }
         }
     }
@@ -4334,16 +4404,14 @@ static void load_thread_fn() {
     const vaf::VafEntry* ag = g_archive.find("assets/main/agent.glb");
     if (!ag) ag = g_archive.find("agent.glb");
     if (ag) {
-        Bytes agd;
-        u64 total = ag->size;
         std::vector<u8> acc;
-        acc.reserve(size_t(total));
+        acc.reserve(size_t(ag->size));
         auto sink = [&](const u8* p, size_t n) -> bool {
             acc.insert(acc.end(), p, p + n);
             return true;
         };
         auto prog = [&](u64 done) {
-            set_progress(69.f + 27.f * float(double(done) / double(total > 0 ? total : 1)));
+            set_progress(69.f + 27.f * float(double(done) / double(ag->size > 0 ? ag->size : 1)));
         };
         if (g_archive.extract_stream(*ag, sink, prog)) {
             set_progress(96.f);
@@ -4388,7 +4456,7 @@ static void native_frame_impl(double time_ms) {
         std::vector<u8>().swap(g_font_ru);
         std::vector<u8>().swap(g_font_tr);
     }
-    if (ui::app.phase == ui::PHASE_MENU || ui::app.fade_in > 0.f) {
+    if (ui::app.phase == ui::PHASE_LOADING || ui::app.phase == ui::PHASE_MENU || ui::app.phase == ui::PHASE_AUTH) {
         ui::render_frame(c);
         eglSwapBuffers(c.display, c.surface);
     }
@@ -4443,6 +4511,23 @@ Java_com_varazdp_wararena_MainActivity_nativeInit(JNIEnv* env, jobject, jobject 
     m_pref = env->GetMethodID(cls, "onNativePref", "(Ljava/lang/String;)Ljava/lang/String;");
     m_set_pref = env->GetMethodID(cls, "onNativeSetPref", "(Ljava/lang/String;Ljava/lang/String;)V");
     m_get_assets = env->GetMethodID(cls, "getAssets", "()Landroid/content/res/AssetManager;");
+    m_show_auth = env->GetMethodID(cls, "onNativeShowAuth", "()V");
+    m_hide_auth = env->GetMethodID(cls, "onNativeHideAuth", "()V");
+    m_start_music = env->GetMethodID(cls, "onNativeStartMusic", "()V");
+    m_stop_music = env->GetMethodID(cls, "onNativeStopMusic", "()V");
+    m_logout = env->GetMethodID(cls, "onNativeLogout", "()V");
+    m_request_exit = env->GetMethodID(cls, "onNativeRequestExit", "()V");
+    m_session_get = env->GetMethodID(cls, "onNativeSessionGet", "()Ljava/lang/String;");
+    m_session_clear_j = env->GetMethodID(cls, "onNativeSessionClear", "()V");
+    m_auth_image = env->GetMethodID(cls, "onNativeAuthImage", "([B)V");
+
+    ui::auth_cb_show = []() { call_void(m_show_auth); };
+    ui::auth_cb_hide = []() { call_void(m_hide_auth); };
+    ui::auth_cb_start_music = []() { call_void(m_start_music); };
+    ui::auth_cb_stop_music = []() { call_void(m_stop_music); };
+    ui::auth_cb_logout = []() { call_void(m_logout); };
+    ui::request_exit_cb = []() { call_void(m_request_exit); };
+
     if (m_get_assets && g_activity) {
         jobject am = env->CallObjectMethod(g_activity, m_get_assets);
         if (am) {
@@ -4461,6 +4546,20 @@ Java_com_varazdp_wararena_MainActivity_nativeInit(JNIEnv* env, jobject, jobject 
         env->ReleaseStringUTFChars(version, ver);
     }
     glr::gl_ctx.density = density;
+
+    {
+        JNIEnv* e = jenv();
+        if (e && m_session_get) {
+            jstring js = (jstring)e->CallObjectMethod(g_activity, m_session_get);
+            if (js) {
+                const char* c = e->GetStringUTFChars(js, nullptr);
+                ui::app.session_valid = c && *c;
+                if (c) e->ReleaseStringUTFChars(js, c);
+                e->DeleteLocalRef(js);
+            }
+        }
+    }
+
     ui::load_prefs();
     security::start();
     if (g_asset_mgr) start_load_thread();
@@ -4502,8 +4601,32 @@ Java_com_varazdp_wararena_MainActivity_nativeAgentDone(JNIEnv*, jobject) {
     g_agent_done = true;
 }
 
-
+extern "C" JNIEXPORT void JNICALL
+Java_com_varazdp_wararena_MainActivity_nativeAuthResult(JNIEnv*, jobject, jboolean ok) {
+    ui::app.session_valid = ok == JNI_TRUE;
+    if (ok) {
+        ui::app.phase = ui::PHASE_MENU;
+        ui::app.page_anim = 0.f;
+        ui::app.intro = 0.f;
+        if (ui::auth_cb_start_music) ui::auth_cb_start_music();
+    } else {
+        ui::app.phase = ui::PHASE_AUTH;
+    }
 }
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_varazdp_wararena_MainActivity_nativeStartMusicFile(JNIEnv*, jobject) {
+    if (security::event() != security::EVENT_NONE) return;
+    if (g_music_path.empty()) return;
+    JNIEnv* e = jenv();
+    if (e && g_activity && m_music_ready) {
+        jstring jp = e->NewStringUTF(g_music_path.c_str());
+        e->CallVoidMethod(g_activity, m_music_ready, jp);
+        e->DeleteLocalRef(jp);
+    }
+}
+
+} 
 
 #else
 
